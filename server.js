@@ -2,6 +2,8 @@
 const express = require("express");
 const cheerio = require("cheerio");
 const RSS = require("rss");
+const dns = require("node:dns");
+dns.setDefaultResultOrder("ipv4first");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
