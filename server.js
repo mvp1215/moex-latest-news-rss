@@ -3,97 +3,74 @@ const cheerio = require("cheerio");
 const RSS = require("rss");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const SOURCE_URL = "https://wwwc.moex.gov.tw/main/news/wfrmNews.aspx?kind=3&menu_id=42";
+const PORT = process.env.PORT || 10000;
 
-let cachedFeed = "";
-let lastUpdated = 0;
-let refreshPromise = null;
+const SOURCE_URL =
+  "https://wwwc.moex.gov.tw/main/news/wfrmNewsRSSdetail.aspx?Kind=3";
 
-function rocDateToDate(value) {
-  const m = String(value || "").match(/(\d{2,3})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{1,2})/);
-  if (!m) return new Date();
-  return new Date(Date.UTC(Number(m[1]) + 1911, Number(m[2]) - 1, Number(m[3])));
-}
+let cachedXml = "";
+let lastUpdated = null;
+let lastError = null;
+let updating = false;
 
 async function fetchItems() {
   const response = await fetch(SOURCE_URL, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; MOEX-RSS/1.0)", "Accept": "text/html" },
-    signal: AbortSignal.timeout(30000)
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; MoexRSS/1.0)",
+      Accept: "application/rss+xml, application/xml, text/xml, */*"
+    },
+    signal: AbortSignal.timeout(45000)
   });
-  if (!response.ok) throw new Error(`考選部網站回應 HTTP ${response.status}`);
 
-  const $ = cheerio.load(await response.text());
+  if (!response.ok) {
+    throw new Error(`官方 RSS 回應錯誤：HTTP ${response.status}`);
+  }
+
+  const xml = await response.text();
+  const $ = cheerio.load(xml, { xmlMode: true });
+
   const items = [];
-  const seen = new Set();
 
-  $('a[href*="news_id="]').each((_, el) => {
-    const a = $(el);
-    const title = a.text().replace(/\s+/g, " ").trim();
-    const href = a.attr("href");
-    if (!title || !href || seen.has(href)) return;
+  $("item").each((_, element) => {
+    const item = $(element);
 
-    const row = a.closest("tr");
-    const text = (row.length ? row.text() : a.parent().text()).replace(/\s+/g, " ");
-    const match = text.match(/\d{2,3}\s*[\/.-]\s*\d{1,2}\s*[\/.-]\s*\d{1,2}/);
-    const link = new URL(href, SOURCE_URL).toString();
-    if (!link.includes("news_id=")) return;
+    const title = item.find("title").first().text().trim();
+    const link = item.find("link").first().text().trim();
+    const guid = item.find("guid").first().text().trim();
+    const description = item.find("description").first().text().trim();
 
-    seen.add(href);
-    items.push({ title, link, dateText: match ? match[0] : "", date: match ? rocDateToDate(match[0]) : new Date() });
+    const dateText =
+      item.find("pubDate").first().text().trim() ||
+      item.find("dc\\:date").first().text().trim() ||
+      item.find("date").first().text().trim();
+
+    if (!title || !link) return;
+
+    const parsedDate = dateText ? new Date(dateText) : new Date();
+
+    items.push({
+      title,
+      link,
+      guid: guid || link,
+      description,
+      date: Number.isNaN(parsedDate.getTime())
+        ? new Date()
+        : parsedDate
+    });
   });
 
-  if (!items.length) throw new Error("沒有抓到消息項目，官方網頁版型可能已變更。");
+  if (items.length === 0) {
+    throw new Error("官方 RSS 已連線，但沒有解析到任何 item。");
+  }
+
   return items.slice(0, 50);
 }
 
-function buildFeed(items) {
-  const feed = new RSS({
-    title: "考選部｜最新消息",
-    description: "自動整理考選部官方網站「最新消息」。",
-    feed_url: `${process.env.PUBLIC_URL || ""}/rss.xml`,
-    site_url: SOURCE_URL,
-    language: "zh-tw",
-    pubDate: new Date()
-  });
-  for (const item of items) {
-    feed.item({
-      title: item.title,
-      url: item.link,
-      guid: item.link,
-      date: item.date,
-      description: item.dateText ? `發布日期：${item.dateText}` : "考選部最新消息"
-    });
-  }
-  return feed.xml({ indent: true });
-}
+async function updateRSS() {
+  if (updating) return;
+  updating = true;
 
-async function refreshFeed() {
-  if (refreshPromise) return refreshPromise;
-  refreshPromise = (async () => {
-    const items = await fetchItems();
-    cachedFeed = buildFeed(items);
-    lastUpdated = Date.now();
-    console.log(`[RSS] 更新成功，共 ${items.length} 則最新消息`);
-    return cachedFeed;
-  })();
-  try { return await refreshPromise; }
-  finally { refreshPromise = null; }
-}
-
-app.get("/", (_req, res) => res.type("text").send("考選部最新消息 RSS 服務運作中。訂閱網址：/rss.xml；狀態：/health"));
-app.get("/health", (_req, res) => res.json({
-  status: "ok", feed: "/rss.xml", source: SOURCE_URL,
-  lastUpdated: lastUpdated ? new Date(lastUpdated).toISOString() : null
-}));
-app.get("/rss.xml", async (_req, res) => {
   try {
-    if (!cachedFeed || Date.now() - lastUpdated > 15 * 60 * 1000) await refreshFeed();
-    res.set("Content-Type", "application/rss+xml; charset=utf-8").send(cachedFeed);
-  } catch (error) {
-    console.error("[RSS] 更新失敗：", error.message);
-    if (cachedFeed) return res.set("Content-Type", "application/rss+xml; charset=utf-8").set("X-RSS-Stale", "true").send(cachedFeed);
-    res.status(502).type("text").send(`RSS 產生失敗：${error.message}`);
-  }
-});
-app.listen(PORT, () => console.log(`MOEX RSS server listening on port ${PORT}`));
+    const items = await fetchItems();
+
+    const feed =
